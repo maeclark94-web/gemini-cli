@@ -1,0 +1,20 @@
+name: Update Fidelity Statistics
+on:
+  schedule:
+    - cron: '0 0 * * *' # Midnight every night
+  workflow_dispatch: # This adds the "Manual Run" button we discussed!
+
+jobs:
+  update-balance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install firebase-admin
+      - name: Run Finance Script
+        env:
+          SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          PROJECT_ID: "merging-banking"
+        run: node scripts/update_stats.js
