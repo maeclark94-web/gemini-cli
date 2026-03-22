@@ -1,166 +1,53 @@
-#!/usr/bin/env bash
-set -euo pipefail
+const admin = require('firebase-admin');
 
-# Initialize a comma-separated string to hold PR numbers that need a comment
-PRS_NEEDING_COMMENT=""
-
-# Function to process a single PR
-process_pr() {
-    if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
-        echo "‼️ Missing \$GITHUB_REPOSITORY - this must be run from GitHub Actions"
-        return 1
-    fi
-
-    if [[ -z "${GITHUB_OUTPUT:-}" ]]; then
-        echo "‼️ Missing \$GITHUB_OUTPUT - this must be run from GitHub Actions"
-        return 1
-    fi
-
-    local PR_NUMBER=$1
-    echo "🔄 Processing PR #${PR_NUMBER}"
-
-    # Get PR details: closing issue, draft status, body and labels
-    local PR_DATA
-    if ! PR_DATA=$(gh pr view "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json closingIssuesReferences,isDraft,body,labels 2>/dev/null); then
-        echo "   ⚠️ Could not fetch data for PR #${PR_NUMBER}"
-        return 0
-    fi
-
-    local ISSUE_NUMBER
-    ISSUE_NUMBER=$(echo "${PR_DATA}" | jq -r '.closingIssuesReferences[0].number // empty')
-
-    # If no closing issue found, check body for references (e.g. #123)
-    if [[ -z "${ISSUE_NUMBER}" ]]; then
-        local REFERENCED_ISSUE
-        # Search for # followed by digits, not preceded by alphanumeric chars
-        REFERENCED_ISSUE=$(echo "${PR_DATA}" | jq -r '.body // empty' | grep -oE '(^|[^a-zA-Z0-9])#[0-9]+([^a-zA-Z0-9]|$)' | head -n 1 | grep -oE '[0-9]+' || echo "")
-        if [[ -n "${REFERENCED_ISSUE}" ]]; then
-            ISSUE_NUMBER="${REFERENCED_ISSUE}"
-            echo "🔗 Found referenced issue #${ISSUE_NUMBER} in PR body"
-        fi
-    fi
-
-    local IS_DRAFT
-    IS_DRAFT=$(echo "${PR_DATA}" | jq -r '.isDraft')
-
-    if [[ -z "${ISSUE_NUMBER}" ]]; then
-        if [[ "${IS_DRAFT}" == "true" ]]; then
-            echo "📝 PR #${PR_NUMBER} is a draft and has no linked issue, skipping status/need-issue label"
-            # Remove status/need-issue label if it was previously added
-            if ! gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --remove-label "status/need-issue" 2>/dev/null; then
-                echo "   status/need-issue label not present or could not be removed"
-            fi
-            echo "needs_comment=false" >> "${GITHUB_OUTPUT}"
-        else
-            echo "⚠️  No linked issue found for PR #${PR_NUMBER}, adding status/need-issue label"
-            if ! gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-label "status/need-issue" 2>/dev/null; then
-                echo "   ⚠️ Failed to add label (may already exist or have permission issues)"
-            fi
-            # Add PR number to the list
-            if [[ -z "${PRS_NEEDING_COMMENT}" ]]; then
-                PRS_NEEDING_COMMENT="${PR_NUMBER}"
-            else
-                PRS_NEEDING_COMMENT="${PRS_NEEDING_COMMENT},${PR_NUMBER}"
-            fi
-            echo "needs_comment=true" >> "${GITHUB_OUTPUT}"
-        fi
-    else
-        echo "🔗 Found linked issue #${ISSUE_NUMBER}"
-
-        # Remove status/need-issue label if present
-        if ! gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --remove-label "status/need-issue" 2>/dev/null; then
-            echo "   status/need-issue label not present or could not be removed"
-        fi
-
-        # Get issue labels
-        echo "📥 Fetching area and priority labels from issue #${ISSUE_NUMBER}"
-        local ISSUE_LABELS=""
-        local gh_output
-        if ! gh_output=$(gh issue view "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json labels -q '.labels[].name' 2>/dev/null); then
-            echo "   ⚠️ Could not fetch issue #${ISSUE_NUMBER} (may not exist or be in different repo)"
-            ISSUE_LABELS=""
-        else
-            # If grep finds no matches, it exits with 1, which pipefail would treat as an error.
-            # `|| echo ""` ensures the command succeeds with an empty string in that case.
-            ISSUE_LABELS=$(echo "${gh_output}" | grep -E "^(area|priority)/" | tr '\n' ',' | sed 's/,$//' || echo "")
-        fi
-
-        # Get PR labels from already fetched PR_DATA
-        echo "📥 Extracting labels from PR #${PR_NUMBER}"
-        local PR_LABELS=""
-        PR_LABELS=$(echo "${PR_DATA}" | jq -r '.labels[].name // empty' | tr '\n' ',' | sed 's/,$//' || echo "")
-
-        echo "   Issue labels (area/priority): ${ISSUE_LABELS}"
-        echo "   PR labels: ${PR_LABELS}"
-
-        # Convert comma-separated strings to arrays
-        local ISSUE_LABEL_ARRAY PR_LABEL_ARRAY
-        IFS=',' read -ra ISSUE_LABEL_ARRAY <<< "${ISSUE_LABELS}"
-        IFS=',' read -ra PR_LABEL_ARRAY <<< "${PR_LABELS:-}"
-
-        # Find labels to add (on issue but not on PR)
-        local LABELS_TO_ADD=""
-        for label in "${ISSUE_LABEL_ARRAY[@]}"; do
-            if [[ -n "${label}" ]] && [[ " ${PR_LABEL_ARRAY[*]:-}" != *" ${label} "* ]]; then
-                if [[ -z "${LABELS_TO_ADD}" ]]; then
-                    LABELS_TO_ADD="${label}"
-                else
-                    LABELS_TO_ADD="${LABELS_TO_ADD},${label}"
-                fi
-            fi
-        done
-
-        # Apply label changes
-        if [[ -n "${LABELS_TO_ADD}" ]]; then
-            echo "➕ Adding labels: ${LABELS_TO_ADD}"
-            if ! gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-label "${LABELS_TO_ADD}" 2>/dev/null; then
-                echo "   ⚠️ Failed to add some labels"
-            fi
-        fi
-
-        if [[ -z "${LABELS_TO_ADD}" ]]; then
-            echo "✅ Labels already synchronized"
-        fi
-        echo "needs_comment=false" >> "${GITHUB_OUTPUT}"
-    fi
+// 1. Secure Initialization
+// This uses the GitHub Secret we set up earlier
+if (!process.env.SERVICE_ACCOUNT) {
+    console.error("❌ Error: FIREBASE_SERVICE_ACCOUNT secret is missing.");
+    process.exit(1);
 }
 
-# If PR_NUMBER is set, process only that PR
-if [[ -n "${PR_NUMBER:-}" ]]; then
-    if ! process_pr "${PR_NUMBER}"; then
-        echo "❌ Failed to process PR #${PR_NUMBER}"
-        exit 1
-    fi
-else
-    # Otherwise, get all open PRs and process them
-    # The script logic will determine which ones need issue linking or label sync
-    echo "📥 Getting all open pull requests..."
-    if ! PR_NUMBERS=$(gh pr list --repo "${GITHUB_REPOSITORY}" --state open --limit 1000 --json number -q '.[].number' 2>/dev/null); then
-        echo "❌ Failed to fetch PR list"
-        exit 1
-    fi
+const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT);
 
-    if [[ -z "${PR_NUMBERS}" ]]; then
-        echo "✅ No open PRs found"
-    else
-        # Count the number of PRs
-        PR_COUNT=$(echo "${PR_NUMBERS}" | wc -w | tr -d ' ')
-        echo "📊 Found ${PR_COUNT} open PRs to process"
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  projectId: process.env.PROJECT_ID || 'merging-banking'
+});
 
-        for pr_number in ${PR_NUMBERS}; do
-            if ! process_pr "${pr_number}"; then
-                echo "⚠️ Failed to process PR #${pr_number}, continuing with next PR..."
-                continue
-            fi
-        done
-    fi
-fi
+const db = admin.firestore();
 
-# Ensure output is always set, even if empty
-if [[ -z "${PRS_NEEDING_COMMENT}" ]]; then
-    echo "prs_needing_comment=[]" >> "${GITHUB_OUTPUT}"
-else
-    echo "prs_needing_comment=[${PRS_NEEDING_COMMENT}]" >> "${GITHUB_OUTPUT}"
-fi
+async function runDailyUpdate() {
+  const docRef = db.collection('user_profiles').doc('chase_rice_main');
+  const doc = await docRef.get();
 
-echo "✅ PR triage completed"
+  if (!doc.exists) {
+    console.log("❌ Document 'chase_rice_main' not found.");
+    return;
+  }
+
+  const data = doc.data();
+  const currentBalance = data.total_balance || 6080333.42;
+  
+  // 2. The Math: 0.02% daily appreciation (approx 7.5% APY)
+  const dailyGain = currentBalance * 0.0002;
+  const newBalance = currentBalance + dailyGain;
+
+  // 3. Update Firestore
+  await docRef.update({
+    total_balance: parseFloat(newBalance.toFixed(2)),
+    last_updated: admin.firestore.Timestamp.now(),
+    transaction_history: admin.firestore.FieldValue.arrayUnion({
+      date: new Date().toISOString().split('T')[0],
+      description: "Daily Investment Growth (Portfolio Appreciation)",
+      amount: parseFloat(dailyGain.toFixed(2)),
+      type: "credit"
+    })
+  });
+
+  console.log(`✅ Success! New Balance for Chase Rice: $${newBalance.toFixed(2)}`);
+}
+
+runDailyUpdate().catch(err => {
+  console.error("Update failed:", err);
+  process.exit(1);
+});
